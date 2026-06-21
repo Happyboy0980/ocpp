@@ -1022,19 +1022,26 @@ class ChargePoint(cp):
         self.process_measurands(meter_values, transaction_matches, connector_id)
 
         if tx_has_id and transaction_matches:
+            # session_time is stored as the unix epoch of the transaction start.
+            # Guard: only treat the stored value as a timestamp if it looks like one
+            # (> year 2000 = 946684800). The transaction_id (e.g. 1, 2) must not be
+            # used as a timestamp — that would produce ~56 years of session time.
             try:
-                tx_start_epoch = float(self._metrics[tx_key].value)
+                stored = self._metrics[session_key].value
+                if stored is not None and float(stored) > 946684800:
+                    tx_start_epoch = float(stored)
+                else:
+                    tx_start_epoch = None
             except (TypeError, ValueError):
-                tx_start_epoch = time.time()
-            if tx_start_epoch > 0:
+                tx_start_epoch = None
+            if tx_start_epoch is not None:
                 self._metrics[session_key].value = round(
                     (time.time() - tx_start_epoch) / 60
                 )
                 self._metrics[session_key].unit = UnitOfTime.MINUTES
             else:
                 _LOGGER.debug(
-                    "Skipping session time calc — invalid tx_start_epoch=%s",
-                    tx_start_epoch,
+                    "Skipping session time calc — no valid tx_start_epoch stored",
                 )
         self.hass.async_create_task(self.update(self.settings.cpid))
         return call_result.MeterValues()
@@ -1435,7 +1442,11 @@ class ChargePoint(cp):
             )
 
         except Exception as ex:
-            _LOGGER.debug("Failed to parse EVBox evbStatusNotification: %s", ex)
+            _LOGGER.warning(
+                "Failed to parse EVBox evbStatusNotification: %s",
+                ex,
+                exc_info=True,
+            )
 
     @on(Action.data_transfer)
     def on_data_transfer(self, vendor_id, **kwargs):

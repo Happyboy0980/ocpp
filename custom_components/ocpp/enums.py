@@ -62,6 +62,17 @@ class HAChargerSession(str, Enum):
     meter_start = "Energy.Meter.Start"  # in kWh
 
 
+class HAEVBoxStatuses(str, Enum):
+    """EVBox vendor-specific metrics reported via DataTransfer evbStatusNotification."""
+
+    lock_status = "EVBox.Lock"  # 1 = locked, 0 = unlocked
+    led_color = "EVBox.LED.Color"  # e.g. Blue, Green, Red
+    signal_strength = "EVBox.Signal"  # RSSI %
+    smart_limit = "EVBox.Smart.Limit"  # dynamic smart-charging limit in A
+    max_current = "EVBox.Max.Current"  # configured max current in A
+    vehicle_connected = "EVBox.Vehicle"  # 1 = vehicle present
+
+
 class Profiles(IntFlag):
     """Flags to indicate supported feature profiles."""
 

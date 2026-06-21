@@ -31,7 +31,7 @@ from .const import (
     ICON,
     Measurand,
 )
-from .enums import HAChargerDetails, HAChargerSession, HAChargerStatuses
+from .enums import HAChargerDetails, HAChargerSession, HAChargerStatuses, HAEVBoxStatuses
 
 
 @dataclass
@@ -91,6 +91,9 @@ async def async_setup_entry(hass, entry, async_add_devices):
             HAChargerDetails.config_response.value,
             HAChargerDetails.data_response.value,
             HAChargerDetails.data_transfer.value,
+            # EVBox charger-level diagnostics
+            HAEVBoxStatuses.led_color.value,
+            HAEVBoxStatuses.signal_strength.value,
         ]
 
         CONNECTOR_ONLY = measurands + [
@@ -101,6 +104,11 @@ async def async_setup_entry(hass, entry, async_add_devices):
             HAChargerSession.session_time.value,
             HAChargerSession.session_energy.value,
             HAChargerSession.meter_start.value,
+            # EVBox connector-level metrics
+            HAEVBoxStatuses.lock_status.value,
+            HAEVBoxStatuses.smart_limit.value,
+            HAEVBoxStatuses.max_current.value,
+            HAEVBoxStatuses.vehicle_connected.value,
         ]
 
         def _mk_desc(metric: str, *, cat_diag: bool = False) -> OcppSensorDescription:

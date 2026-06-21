@@ -28,6 +28,7 @@ from ocpp.v16.enums import (
     DataTransferStatus,
     Measurand,
     MessageTrigger,
+    Phase,
     RegistrationStatus,
     RemoteStartStopStatus,
     ResetStatus,
@@ -48,6 +49,7 @@ from .enums import (
     HAChargerDetails as cdet,
     HAChargerSession as csess,
     HAChargerStatuses as cstat,
+    HAEVBoxStatuses as evbox,
     OcppMisc as om,
     Profiles as prof,
 )
@@ -57,6 +59,7 @@ from .const import (
     ChargerSystemSettings,
     DEFAULT_MEASURAND,
     HA_ENERGY_UNIT,
+    HA_POWER_UNIT,
     MEASURANDS,
 )
 
@@ -1217,12 +1220,220 @@ class ChargePoint(cp):
             id_tag_info={om.status.value: AuthorizationStatus.accepted.value}
         )
 
+    @staticmethod
+    def _tokenize_evbox_data(data: str) -> list[str]:
+        """Tokenize EVBox CSV data string that may contain {group,values}."""
+        tokens: list[str] = []
+        current = ""
+        depth = 0
+        for ch in data:
+            if ch == "{":
+                depth += 1
+                current += ch
+            elif ch == "}":
+                depth -= 1
+                current += ch
+            elif ch == "," and depth == 0:
+                tokens.append(current)
+                current = ""
+            else:
+                current += ch
+        if current:
+            tokens.append(current)
+        return tokens
+
+    def _parse_evbox_status_notification(self, data: str, connector_id: int) -> None:
+        """Parse EVBox evbStatusNotification data string and update HA metrics.
+
+        Format (comma-separated, braces denote sub-groups):
+          connectorId, status, errorCode, errorDescription,
+          lockStatus, ledColor, ledMode,
+          {maxCurrentA,powerW,temperatureC},
+          {totalEnergyWh,sessionEnergyWh},
+          {phaseConfig,l1mA,l2mA,l3mA},
+          rfidAuthStatus, transactionId, seqNum, timestamp,
+          vehicleConnected, signalStrengthPct,
+          {voltageV,...},
+          smartLimitRaw, temperature2C, ...
+        """
+        tokens = self._tokenize_evbox_data(data)
+        if len(tokens) < 16:
+            _LOGGER.debug(
+                "EVBox evbStatusNotification has only %d tokens, expected >=16; skipping",
+                len(tokens),
+            )
+            return
+
+        try:
+            status = tokens[1]
+            error_code = tokens[2]
+            led_color = tokens[5] if len(tokens) > 5 else None
+            lock_raw = tokens[4] if len(tokens) > 4 else None
+            try:
+                lock_status = int(lock_raw)
+            except (TypeError, ValueError):
+                lock_status = lock_raw
+            try:
+                signal_strength = int(tokens[15])
+            except (TypeError, ValueError, IndexError):
+                signal_strength = None
+
+            # {maxCurrentA, powerW, temperatureC}
+            power_parts = tokens[7].strip("{}").split(",")
+            max_current_a = float(power_parts[0]) if len(power_parts) > 0 else None
+            power_w = float(power_parts[1]) if len(power_parts) > 1 else None
+            temperature_c = float(power_parts[2]) if len(power_parts) > 2 else None
+
+            # {totalEnergyWh, sessionEnergyWh}
+            energy_parts = tokens[8].strip("{}").split(",")
+            total_energy_wh = float(energy_parts[0]) if len(energy_parts) > 0 else None
+            session_energy_wh = float(energy_parts[1]) if len(energy_parts) > 1 else None
+
+            # {phaseConfig, l1_mA, l2_mA, l3_mA}
+            current_parts = tokens[9].strip("{}").split(",")
+            current_l1_ma = float(current_parts[1]) if len(current_parts) > 1 else None
+            current_l2_ma = float(current_parts[2]) if len(current_parts) > 2 else None
+            current_l3_ma = float(current_parts[3]) if len(current_parts) > 3 else None
+
+            # {voltageV, ...} at index 16
+            voltage_v = None
+            if len(tokens) > 16:
+                voltage_parts = tokens[16].strip("{}").split(",")
+                try:
+                    voltage_v = float(voltage_parts[0])
+                except (ValueError, IndexError):
+                    pass
+
+            # Smart charging limit in 0.1 A units at index 17
+            smart_limit_a = None
+            if len(tokens) > 17:
+                try:
+                    smart_limit_a = float(tokens[17]) / 10.0
+                except (ValueError, TypeError):
+                    pass
+
+            cid = connector_id
+
+            # --- Status & error --------------------------------------------------
+            self._metrics[(cid, cstat.status_connector.value)].value = status
+            self._metrics[(cid, cstat.error_code_connector.value)].value = error_code
+
+            # --- Power: W → kW ---------------------------------------------------
+            if power_w is not None:
+                self._metrics[(cid, Measurand.power_active_import.value)].value = (
+                    power_w / 1000.0
+                )
+                self._metrics[(cid, Measurand.power_active_import.value)].unit = (
+                    HA_POWER_UNIT
+                )
+
+            # --- Total lifetime energy: Wh → kWh ---------------------------------
+            if total_energy_wh is not None:
+                self._metrics[
+                    (cid, Measurand.energy_active_import_register.value)
+                ].value = total_energy_wh / 1000.0
+                self._metrics[
+                    (cid, Measurand.energy_active_import_register.value)
+                ].unit = HA_ENERGY_UNIT
+
+            # --- Session energy: Wh → kWh ----------------------------------------
+            if session_energy_wh is not None:
+                self._metrics[(cid, csess.session_energy.value)].value = (
+                    session_energy_wh / 1000.0
+                )
+                self._metrics[(cid, csess.session_energy.value)].unit = HA_ENERGY_UNIT
+
+            # --- Per-phase current: mA → A ----------------------------------------
+            if any(v is not None for v in [current_l1_ma, current_l2_ma, current_l3_ma]):
+                l1_a = (current_l1_ma or 0.0) / 1000.0
+                l2_a = (current_l2_ma or 0.0) / 1000.0
+                l3_a = (current_l3_ma or 0.0) / 1000.0
+                # Use max phase current: correct for single-phase (active phase = max)
+                # and for 3-phase balanced (max ≈ per-phase current).
+                max_current = max(l1_a, l2_a, l3_a)
+                self._metrics[(cid, Measurand.current_import.value)].value = max_current
+                self._metrics[(cid, Measurand.current_import.value)].unit = "A"
+                self._metrics[(cid, Measurand.current_import.value)].extra_attr = {
+                    Phase.l1.value: l1_a,
+                    Phase.l2.value: l2_a,
+                    Phase.l3.value: l3_a,
+                }
+
+            # --- Voltage: V -------------------------------------------------------
+            if voltage_v is not None:
+                self._metrics[(cid, Measurand.voltage.value)].value = voltage_v
+                self._metrics[(cid, Measurand.voltage.value)].unit = "V"
+
+            # --- Temperature: °C --------------------------------------------------
+            if temperature_c is not None:
+                self._metrics[(cid, Measurand.temperature.value)].value = temperature_c
+                self._metrics[(cid, Measurand.temperature.value)].unit = "celsius"
+
+            # --- EVBox-specific sensors (connector-level) -----------------------
+            self._metrics[(cid, evbox.lock_status.value)].value = lock_status
+            self._metrics[(cid, evbox.max_current.value)].value = max_current_a
+            self._metrics[(cid, evbox.max_current.value)].unit = "A"
+            self._metrics[(cid, evbox.vehicle_connected.value)].value = (
+                bool(int(tokens[14])) if len(tokens) > 14 and tokens[14].isdigit() else None
+            )
+            if smart_limit_a is not None:
+                self._metrics[(cid, evbox.smart_limit.value)].value = smart_limit_a
+                self._metrics[(cid, evbox.smart_limit.value)].unit = "A"
+
+            # --- EVBox-specific sensors (charger-level) --------------------------
+            self._metrics[0][evbox.led_color.value].value = led_color
+            if signal_strength is not None:
+                self._metrics[0][evbox.signal_strength.value].value = signal_strength
+                self._metrics[0][evbox.signal_strength.value].unit = "%"
+
+            # --- Summary attributes on the data_transfer timestamp sensor --------
+            self._metrics[0][cdet.data_transfer.value].extra_attr = {
+                "evbox_status": status,
+                "evbox_error_code": error_code,
+                "evbox_led_color": led_color,
+                "evbox_lock_status": lock_status,
+                "evbox_signal_strength_pct": signal_strength,
+                "evbox_max_current_a": max_current_a,
+                "evbox_smart_limit_a": smart_limit_a,
+                "evbox_connector_id": cid,
+            }
+
+            _LOGGER.debug(
+                "EVBox %s connector %s: status=%s power=%.1fW energy=%.3fkWh"
+                " session=%.3fkWh voltage=%sV temp=%s°C signal=%s%%",
+                self.id,
+                cid,
+                status,
+                power_w or 0,
+                (total_energy_wh or 0) / 1000.0,
+                (session_energy_wh or 0) / 1000.0,
+                voltage_v,
+                temperature_c,
+                signal_strength,
+            )
+
+        except Exception as ex:
+            _LOGGER.debug("Failed to parse EVBox evbStatusNotification: %s", ex)
+
     @on(Action.data_transfer)
     def on_data_transfer(self, vendor_id, **kwargs):
         """Handle a Data transfer request."""
         _LOGGER.debug("Data transfer received from %s: %s", self.id, kwargs)
         self._metrics[0][cdet.data_transfer.value].value = datetime.now(tz=UTC)
         self._metrics[0][cdet.data_transfer.value].extra_attr = {vendor_id: kwargs}
+
+        # Handle EVBox vendor-specific messages
+        if vendor_id == "EV-BOX":
+            message_id = kwargs.get("message_id", "")
+            data = kwargs.get("data", "")
+            if message_id == "evbStatusNotification" and data:
+                try:
+                    raw_connector = int(self._tokenize_evbox_data(data)[0])
+                except Exception:
+                    raw_connector = 1
+                self._parse_evbox_status_notification(data, raw_connector)
+                self.hass.async_create_task(self.update(self.settings.cpid))
+
         return call_result.DataTransfer(status=DataTransferStatus.accepted.value)
 
     @on(Action.heartbeat)

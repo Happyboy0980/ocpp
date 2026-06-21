@@ -1289,18 +1289,32 @@ class ChargePoint(cp):
             total_energy_wh = float(energy_parts[0]) if len(energy_parts) > 0 else None
             session_energy_wh = float(energy_parts[1]) if len(energy_parts) > 1 else None
 
-            # {phaseConfig, l1_mA, l2_mA, l3_mA}
-            current_parts = tokens[9].strip("{}").split(",")
-            current_l1_ma = float(current_parts[1]) if len(current_parts) > 1 else None
-            current_l2_ma = float(current_parts[2]) if len(current_parts) > 2 else None
-            current_l3_ma = float(current_parts[3]) if len(current_parts) > 3 else None
+            # token[9]: {phaseConfig, val1, val2, val3} — internal EVBox phase counters,
+            # NOT per-phase current. Store raw for diagnostics only.
+            _t9_parts = tokens[9].strip("{}").split(",")
 
-            # {voltageV, ...} at index 16
+            # token[16]: {voltageV, ?, ?, L1_dA, L2_dA, L3_dA, ?, ?, ?}
+            # Positions 3/4/5 are per-phase current in units of 0.1 A (deciamperes).
             voltage_v = None
+            current_l1_da = None  # deciamperes (0.1 A)
+            current_l2_da = None
+            current_l3_da = None
             if len(tokens) > 16:
-                voltage_parts = tokens[16].strip("{}").split(",")
+                grid_parts = tokens[16].strip("{}").split(",")
                 try:
-                    voltage_v = float(voltage_parts[0])
+                    voltage_v = float(grid_parts[0])
+                except (ValueError, IndexError):
+                    pass
+                try:
+                    current_l1_da = float(grid_parts[3])
+                except (ValueError, IndexError):
+                    pass
+                try:
+                    current_l2_da = float(grid_parts[4])
+                except (ValueError, IndexError):
+                    pass
+                try:
+                    current_l3_da = float(grid_parts[5])
                 except (ValueError, IndexError):
                     pass
 
@@ -1343,13 +1357,15 @@ class ChargePoint(cp):
                 )
                 self._metrics[(cid, csess.session_energy.value)].unit = HA_ENERGY_UNIT
 
-            # --- Per-phase current: mA → A ----------------------------------------
-            if any(v is not None for v in [current_l1_ma, current_l2_ma, current_l3_ma]):
-                l1_a = (current_l1_ma or 0.0) / 1000.0
-                l2_a = (current_l2_ma or 0.0) / 1000.0
-                l3_a = (current_l3_ma or 0.0) / 1000.0
-                # Use max phase current: correct for single-phase (active phase = max)
-                # and for 3-phase balanced (max ≈ per-phase current).
+            # --- Per-phase current: deciamperes (0.1 A) → A ---------------------
+            # Values are in token[16] positions 3/4/5.
+            # e.g. 192 → 19.2 A, 0 → 0 A (inactive phase on single-phase car)
+            if any(v is not None for v in [current_l1_da, current_l2_da, current_l3_da]):
+                l1_a = (current_l1_da or 0.0) / 10.0
+                l2_a = (current_l2_da or 0.0) / 10.0
+                l3_a = (current_l3_da or 0.0) / 10.0
+                # Use max phase: gives the active phase on single-phase,
+                # and per-phase value on balanced 3-phase.
                 max_current = max(l1_a, l2_a, l3_a)
                 self._metrics[(cid, Measurand.current_import.value)].value = max_current
                 self._metrics[(cid, Measurand.current_import.value)].unit = "A"
@@ -1398,9 +1414,12 @@ class ChargePoint(cp):
                 "evbox_connector_id": cid,
             }
 
+            _l1 = (current_l1_da or 0.0) / 10.0 if current_l1_da is not None else None
+            _l2 = (current_l2_da or 0.0) / 10.0 if current_l2_da is not None else None
+            _l3 = (current_l3_da or 0.0) / 10.0 if current_l3_da is not None else None
             _LOGGER.debug(
                 "EVBox %s connector %s: status=%s power=%.1fW energy=%.3fkWh"
-                " session=%.3fkWh voltage=%sV temp=%s°C signal=%s%%",
+                " session=%.3fkWh voltage=%sV L1=%sA L2=%sA L3=%sA temp=%s°C signal=%s%%",
                 self.id,
                 cid,
                 status,
@@ -1408,6 +1427,9 @@ class ChargePoint(cp):
                 (total_energy_wh or 0) / 1000.0,
                 (session_energy_wh or 0) / 1000.0,
                 voltage_v,
+                _l1,
+                _l2,
+                _l3,
                 temperature_c,
                 signal_strength,
             )

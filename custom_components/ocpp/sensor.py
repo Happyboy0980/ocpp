@@ -94,6 +94,8 @@ async def async_setup_entry(hass, entry, async_add_devices):
             # EVBox charger-level diagnostics
             HAEVBoxStatuses.led_color.value,
             HAEVBoxStatuses.signal_strength.value,
+            HAEVBoxStatuses.max_power.value,
+            HAEVBoxStatuses.cellular_bars.value,
         ]
 
         CONNECTOR_ONLY = measurands + [
@@ -109,6 +111,8 @@ async def async_setup_entry(hass, entry, async_add_devices):
             HAEVBoxStatuses.smart_limit.value,
             HAEVBoxStatuses.max_current.value,
             HAEVBoxStatuses.vehicle_connected.value,
+            HAEVBoxStatuses.pilot_state.value,
+            HAEVBoxStatuses.cp_duty_cycle.value,
         ]
 
         def _mk_desc(metric: str, *, cat_diag: bool = False) -> OcppSensorDescription:

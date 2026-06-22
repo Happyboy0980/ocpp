@@ -67,10 +67,14 @@ class HAEVBoxStatuses(str, Enum):
 
     lock_status = "EVBox.Lock"  # 1 = locked, 0 = unlocked
     led_color = "EVBox.LED.Color"  # e.g. Blue, Green, Red
-    signal_strength = "EVBox.Signal"  # RSSI %
-    smart_limit = "EVBox.Smart.Limit"  # dynamic smart-charging limit in A
-    max_current = "EVBox.Max.Current"  # configured max current in A
-    vehicle_connected = "EVBox.Vehicle"  # 1 = vehicle present
+    signal_strength = "EVBox.Signal"  # WiFi RSSI dBm: new FW = -tok[15]; old FW = -ord(pilotChar)
+    smart_limit = "EVBox.Smart.Limit"  # OCPP current limit A (tok[23]/10 when session active)
+    max_current = "EVBox.Max.Current"  # hardware rated max current A (tok[7][0]; 32A constant)
+    vehicle_connected = "EVBox.Vehicle"  # True = vehicle present (pilot state B or C)
+    pilot_state = "EVBox.Pilot.State"  # IEC 61851 pilot state: A=no car, B=connected, C=charging
+    cp_duty_cycle = "EVBox.CP.Duty"  # CP PWM duty cycle % (13%≈8A, 26%≈16A, 53%≈32A, 100%=no car)
+    max_power = "EVBox.Max.Power"  # charger rated max power in kW (tok[7][1]/1000)
+    cellular_bars = "EVBox.Cellular"  # cellular signal bars 0–5 (tok[19])
 
 
 class Profiles(IntFlag):

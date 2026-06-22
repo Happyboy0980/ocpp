@@ -1252,16 +1252,44 @@ class ChargePoint(cp):
     def _parse_evbox_status_notification(self, data: str, connector_id: int) -> None:
         """Parse EVBox evbStatusNotification data string and update HA metrics.
 
-        Format (comma-separated, braces denote sub-groups):
-          connectorId, status, errorCode, errorDescription,
-          lockStatus, ledColor, ledMode,
-          {maxCurrentA,powerW,temperatureC},
-          {totalEnergyWh,sessionEnergyWh},
-          {phaseConfig,l1mA,l2mA,l3mA},
-          rfidAuthStatus, transactionId, seqNum, timestamp,
-          vehicleConnected, signalStrengthPct,
-          {voltageV,...},
-          smartLimitRaw, temperature2C, ...
+        Format — 25 top-level tokens (commas inside {…} do not split):
+          tok[0]  connectorId
+          tok[1]  status              Available|Charging|Preparing|SuspendedEV(SE)
+          tok[2]  errorCode
+          tok[3]  info
+          tok[4]  vendorErrorCode     1=session active, 0=idle
+          tok[5]  ledColor
+          tok[6]  ledOn
+          tok[7]  {hwMaxCurrentA, maxPowerW, dutyPct}
+                    hwMaxCurrentA  = charger hardware max A (32 for this unit); 0 when no car
+                    maxPowerW      = rated max power W (~4800)
+                    dutyPct        = CP PWM duty cycle % (13%≈8A, 26%≈16A, 53%≈32A, 100%=no car)
+                    offered_current = duty * 0.6  (valid for 10–85%)
+          tok[8]  {lifetimeEnergyWh, sessionEnergyWh}
+          tok[9]  {pilotStateChar, supplyMV, peakPosMV, peakNegMV}
+                    pilotStateChar = IEC 61851: A≈12V no car, B≈9V connected, C≈6V charging
+                    peakPosMV      confirms state: ~12000=A, ~9000=B, ~6000=C
+          tok[10] unknown1
+          tok[11] unknown2
+          tok[12] gridVoltage_V       L-L voltage (380–410 V)
+          tok[13] timestamp           ISO-8601 UTC
+          tok[14] transactionId       0 = no active session
+          tok[15] firmwareDiscriminator
+                    > 3  → new firmware (W7.x): value is WiFi RSSI magnitude (e.g. 78 → -78 dBm)
+                    ≤ 3  → old firmware (W6.x): value is number of phases; use pilot ASCII for RSSI
+          tok[16] meterGroup {L1_V, tempC, unk, currentDa, 0, 0, pfX1000, 0, 0}  [new FW only]
+                    [0] L1 phase voltage V (sags under load: 234V idle → 218V at 32A)
+                    [1] internal temperature °C (tentative — drops when cooling fan runs)
+                    [3] measured current dA  (÷10 → A;  73=7.3A, 152=15.2A, 310=31.0A confirmed)
+                    [6] power factor × 1000  (e.g. 999 → 0.999)
+          tok[17] unknown3            varies: 270 idle, 300–310 charging
+          tok[18] sessionDuration_min
+          tok[19] cellularSignalBars  0–5
+          tok[20] internalParam       slowly drifting, identity unknown
+          tok[21] unknown5
+          tok[22] clockAlignedInterval_s
+          tok[23] ocppCurrentLimit_dA  ONLY valid when tok[14]>0; else HeartbeatInterval
+          tok[24] firmwareParam        constant 5004
         """
         tokens = self._tokenize_evbox_data(data)
         if len(tokens) < 16:
@@ -1280,58 +1308,112 @@ class ChargePoint(cp):
                 lock_status = int(lock_raw)
             except (TypeError, ValueError):
                 lock_status = lock_raw
-            try:
-                signal_strength = int(tokens[15])
-            except (TypeError, ValueError, IndexError):
-                signal_strength = None
 
-            # {maxCurrentA, powerW, temperatureC}
+            # tok[7]: {hwMaxCurrentA, maxPowerW, dutyPct}
             power_parts = tokens[7].strip("{}").split(",")
-            max_current_a = float(power_parts[0]) if len(power_parts) > 0 else None
-            power_w = float(power_parts[1]) if len(power_parts) > 1 else None
-            temperature_c = float(power_parts[2]) if len(power_parts) > 2 else None
+            hw_max_current_a = float(power_parts[0]) if len(power_parts) > 0 else None  # hardware rated max (32A constant; 0 when no car)
+            max_power_w = float(power_parts[1]) if len(power_parts) > 1 else None        # rated max power W
+            duty_cycle_pct = float(power_parts[2]) if len(power_parts) > 2 else None     # CP PWM duty cycle %
+            # Offered current from duty cycle (IEC 61851, valid for 10–85%)
+            offered_current_a = (
+                duty_cycle_pct * 0.6
+                if duty_cycle_pct is not None and 10 <= duty_cycle_pct <= 85
+                else None
+            )
 
-            # {totalEnergyWh, sessionEnergyWh}
+            # tok[8]: {lifetimeEnergyWh, sessionEnergyWh}
             energy_parts = tokens[8].strip("{}").split(",")
             total_energy_wh = float(energy_parts[0]) if len(energy_parts) > 0 else None
             session_energy_wh = float(energy_parts[1]) if len(energy_parts) > 1 else None
 
-            # token[9]: {phaseConfig, val1, val2, val3} — internal EVBox phase counters,
-            # NOT per-phase current. Store raw for diagnostics only.
+            # tok[9]: {pilotStateChar, supplyMV, peakPosMV, peakNegMV}
             _t9_parts = tokens[9].strip("{}").split(",")
+            pilot_state_char = None
+            if _t9_parts:
+                _first = _t9_parts[0].strip()
+                if _first and _first[0].isalpha():
+                    pilot_state_char = _first[0].upper()  # A=no car, B=connected, C=charging
 
-            # token[16]: {voltageV, ?, ?, L1_dA, L2_dA, L3_dA, ?, ?, ?}
-            # Positions 3/4/5 are per-phase current in units of 0.1 A (deciamperes).
+            # tok[15]: firmware discriminator
+            # > 3  → new firmware (W7.x): value is WiFi RSSI magnitude, tok[16] meter group valid
+            # ≤ 3  → old firmware (W6.x): value is number of phases; pilot char ASCII ≈ RSSI
+            fw_disc = None
+            try:
+                fw_disc = int(tokens[15])
+            except (TypeError, ValueError, IndexError):
+                pass
+            is_new_firmware = fw_disc is not None and fw_disc > 3
+            if is_new_firmware:
+                wifi_rssi_dbm = -fw_disc  # e.g. 78 → -78 dBm
+            elif pilot_state_char is not None:
+                wifi_rssi_dbm = -ord(pilot_state_char)  # old FW: 'A'=65 → -65 dBm
+            else:
+                wifi_rssi_dbm = None
+
+            # tok[14]: transactionId (0 = no active session)
+            transaction_id_evb = None
+            try:
+                transaction_id_evb = int(tokens[14]) if len(tokens) > 14 else None
+            except (TypeError, ValueError):
+                pass
+
+            # tok[23]: OCPP current limit in dA — only valid when a transaction is active
+            ocpp_limit_a = None
+            if len(tokens) > 23 and transaction_id_evb:
+                try:
+                    ocpp_limit_a = float(tokens[23]) / 10.0
+                except (TypeError, ValueError):
+                    pass
+
+            # tok[19]: cellular signal bars 0–5
+            cellular_bars = None
+            try:
+                cellular_bars = int(tokens[19]) if len(tokens) > 19 else None
+            except (TypeError, ValueError):
+                pass
+
+            # tok[16]: meter group {L1_V, tempC, unk, currentDa, 0, 0, pfX1000, 0, 0}
+            # Only meaningful on new firmware; on old firmware tok[16] may not exist.
             voltage_v = None
-            current_l1_da = None  # deciamperes (0.1 A)
+            internal_temp_c = None
+            current_l1_da = None
             current_l2_da = None
             current_l3_da = None
+            power_factor = None
             if len(tokens) > 16:
-                grid_parts = tokens[16].strip("{}").split(",")
+                meter_parts = tokens[16].strip("{}").split(",")
                 try:
-                    voltage_v = float(grid_parts[0])
+                    voltage_v = float(meter_parts[0])
                 except (ValueError, IndexError):
                     pass
                 try:
-                    current_l1_da = float(grid_parts[3])
+                    internal_temp_c = float(meter_parts[1])
                 except (ValueError, IndexError):
                     pass
                 try:
-                    current_l2_da = float(grid_parts[4])
+                    current_l1_da = float(meter_parts[3])
                 except (ValueError, IndexError):
                     pass
                 try:
-                    current_l3_da = float(grid_parts[5])
+                    current_l2_da = float(meter_parts[4])
+                except (ValueError, IndexError):
+                    pass
+                try:
+                    current_l3_da = float(meter_parts[5])
+                except (ValueError, IndexError):
+                    pass
+                try:
+                    pf_raw = float(meter_parts[6])
+                    power_factor = pf_raw / 1000.0 if pf_raw > 0 else None
                 except (ValueError, IndexError):
                     pass
 
-            # Smart charging limit in 0.1 A units at index 17
-            smart_limit_a = None
-            if len(tokens) > 17:
-                try:
-                    smart_limit_a = float(tokens[17]) / 10.0
-                except (ValueError, TypeError):
-                    pass
+            # Calculate active power: V × I × PF
+            active_power_w = None
+            if voltage_v is not None and current_l1_da is not None:
+                measured_a = current_l1_da / 10.0
+                pf = power_factor if power_factor is not None else 1.0
+                active_power_w = voltage_v * measured_a * pf
 
             cid = connector_id
 
@@ -1339,10 +1421,10 @@ class ChargePoint(cp):
             self._metrics[(cid, cstat.status_connector.value)].value = status
             self._metrics[(cid, cstat.error_code_connector.value)].value = error_code
 
-            # --- Power: W → kW ---------------------------------------------------
-            if power_w is not None:
+            # --- Active power: V × I × PF → kW ----------------------------------
+            if active_power_w is not None:
                 self._metrics[(cid, Measurand.power_active_import.value)].value = (
-                    power_w / 1000.0
+                    active_power_w / 1000.0
                 )
                 self._metrics[(cid, Measurand.power_active_import.value)].unit = (
                     HA_POWER_UNIT
@@ -1364,17 +1446,13 @@ class ChargePoint(cp):
                 )
                 self._metrics[(cid, csess.session_energy.value)].unit = HA_ENERGY_UNIT
 
-            # --- Per-phase current: deciamperes (0.1 A) → A ---------------------
-            # Values are in token[16] positions 3/4/5.
-            # e.g. 192 → 19.2 A, 0 → 0 A (inactive phase on single-phase car)
+            # --- Per-phase current: dA → A ----------------------------------------
             if any(v is not None for v in [current_l1_da, current_l2_da, current_l3_da]):
                 l1_a = (current_l1_da or 0.0) / 10.0
                 l2_a = (current_l2_da or 0.0) / 10.0
                 l3_a = (current_l3_da or 0.0) / 10.0
-                # Use max phase: gives the active phase on single-phase,
-                # and per-phase value on balanced 3-phase.
-                max_current = max(l1_a, l2_a, l3_a)
-                self._metrics[(cid, Measurand.current_import.value)].value = max_current
+                max_measured = max(l1_a, l2_a, l3_a)
+                self._metrics[(cid, Measurand.current_import.value)].value = max_measured
                 self._metrics[(cid, Measurand.current_import.value)].unit = "A"
                 self._metrics[(cid, Measurand.current_import.value)].extra_attr = {
                     Phase.l1.value: l1_a,
@@ -1382,63 +1460,97 @@ class ChargePoint(cp):
                     Phase.l3.value: l3_a,
                 }
 
-            # --- Voltage: V -------------------------------------------------------
+            # --- Voltage: L1-N phase voltage V ------------------------------------
             if voltage_v is not None:
                 self._metrics[(cid, Measurand.voltage.value)].value = voltage_v
                 self._metrics[(cid, Measurand.voltage.value)].unit = "V"
 
-            # --- Temperature: °C --------------------------------------------------
-            if temperature_c is not None:
-                self._metrics[(cid, Measurand.temperature.value)].value = temperature_c
+            # --- Power factor (meter group [6] / 1000) ----------------------------
+            if power_factor is not None:
+                self._metrics[(cid, Measurand.power_factor.value)].value = power_factor
+                self._metrics[(cid, Measurand.power_factor.value)].unit = ""
+
+            # --- Internal temperature °C (meter group [1], tentative) ------------
+            if internal_temp_c is not None:
+                self._metrics[(cid, Measurand.temperature.value)].value = internal_temp_c
                 self._metrics[(cid, Measurand.temperature.value)].unit = "celsius"
 
-            # --- EVBox-specific sensors (connector-level) -----------------------
+            # --- EVBox-specific sensors (connector-level) -------------------------
             self._metrics[(cid, evbox.lock_status.value)].value = lock_status
-            self._metrics[(cid, evbox.max_current.value)].value = max_current_a
-            self._metrics[(cid, evbox.max_current.value)].unit = "A"
-            self._metrics[(cid, evbox.vehicle_connected.value)].value = (
-                bool(int(tokens[14])) if len(tokens) > 14 and tokens[14].isdigit() else None
+            vehicle_connected = (
+                pilot_state_char in ("B", "C") if pilot_state_char is not None else None
             )
-            if smart_limit_a is not None:
-                self._metrics[(cid, evbox.smart_limit.value)].value = smart_limit_a
+            self._metrics[(cid, evbox.vehicle_connected.value)].value = vehicle_connected
+            # Hardware rated max current from tok[7][0] (constant 32A; 0 when no car)
+            if hw_max_current_a is not None:
+                self._metrics[(cid, evbox.max_current.value)].value = hw_max_current_a
+                self._metrics[(cid, evbox.max_current.value)].unit = "A"
+            # OCPP current limit from tok[23] — only valid during active session
+            if ocpp_limit_a is not None:
+                self._metrics[(cid, evbox.smart_limit.value)].value = ocpp_limit_a
                 self._metrics[(cid, evbox.smart_limit.value)].unit = "A"
+            elif not transaction_id_evb:
+                self._metrics[(cid, evbox.smart_limit.value)].value = None
+            if pilot_state_char is not None:
+                self._metrics[(cid, evbox.pilot_state.value)].value = pilot_state_char
+            if duty_cycle_pct is not None:
+                self._metrics[(cid, evbox.cp_duty_cycle.value)].value = duty_cycle_pct
+                self._metrics[(cid, evbox.cp_duty_cycle.value)].unit = "%"
 
-            # --- EVBox-specific sensors (charger-level) --------------------------
+            # --- EVBox-specific sensors (charger-level) ---------------------------
             self._metrics[0][evbox.led_color.value].value = led_color
-            if signal_strength is not None:
-                self._metrics[0][evbox.signal_strength.value].value = signal_strength
-                self._metrics[0][evbox.signal_strength.value].unit = "%"
+            if wifi_rssi_dbm is not None:
+                self._metrics[0][evbox.signal_strength.value].value = wifi_rssi_dbm
+                self._metrics[0][evbox.signal_strength.value].unit = "dBm"
+            if max_power_w is not None:
+                self._metrics[0][evbox.max_power.value].value = max_power_w / 1000.0
+                self._metrics[0][evbox.max_power.value].unit = "kW"
+            if cellular_bars is not None:
+                self._metrics[0][evbox.cellular_bars.value].value = cellular_bars
 
-            # --- Summary attributes on the data_transfer timestamp sensor --------
+            # --- Summary attributes on the data_transfer timestamp sensor ---------
             self._metrics[0][cdet.data_transfer.value].extra_attr = {
                 "evbox_status": status,
                 "evbox_error_code": error_code,
                 "evbox_led_color": led_color,
                 "evbox_lock_status": lock_status,
-                "evbox_signal_strength_pct": signal_strength,
-                "evbox_max_current_a": max_current_a,
-                "evbox_smart_limit_a": smart_limit_a,
+                "evbox_pilot_state": pilot_state_char,
+                "evbox_wifi_rssi_dbm": wifi_rssi_dbm,
+                "evbox_firmware": "new" if is_new_firmware else "old",
+                "evbox_cp_duty_cycle_pct": duty_cycle_pct,
+                "evbox_offered_current_a": offered_current_a,
+                "evbox_hw_max_current_a": hw_max_current_a,
+                "evbox_ocpp_limit_a": ocpp_limit_a,
+                "evbox_max_power_kw": (max_power_w / 1000.0) if max_power_w is not None else None,
+                "evbox_power_factor": power_factor,
+                "evbox_active_power_w": active_power_w,
+                "evbox_cellular_bars": cellular_bars,
+                "evbox_transaction_id": transaction_id_evb,
                 "evbox_connector_id": cid,
             }
 
             _l1 = (current_l1_da or 0.0) / 10.0 if current_l1_da is not None else None
-            _l2 = (current_l2_da or 0.0) / 10.0 if current_l2_da is not None else None
-            _l3 = (current_l3_da or 0.0) / 10.0 if current_l3_da is not None else None
             _LOGGER.debug(
-                "EVBox %s connector %s: status=%s power=%.1fW energy=%.3fkWh"
-                " session=%.3fkWh voltage=%sV L1=%sA L2=%sA L3=%sA temp=%s°C signal=%s%%",
+                "EVBox %s conn %s: status=%s pilot=%s fw=%s rssi=%sdBm"
+                " power=%.1fW (V=%.1f I=%.2fA PF=%.3f) duty=%.0f%% offered=%.1fA limit=%sA"
+                " energy=%.3fkWh session=%.3fkWh temp=%s°C cellular=%s",
                 self.id,
                 cid,
                 status,
-                power_w or 0,
+                pilot_state_char,
+                "new" if is_new_firmware else "old",
+                wifi_rssi_dbm,
+                active_power_w or 0,
+                voltage_v or 0,
+                _l1 or 0,
+                power_factor or 0,
+                duty_cycle_pct or 0,
+                offered_current_a or 0,
+                ocpp_limit_a,
                 (total_energy_wh or 0) / 1000.0,
                 (session_energy_wh or 0) / 1000.0,
-                voltage_v,
-                _l1,
-                _l2,
-                _l3,
-                temperature_c,
-                signal_strength,
+                internal_temp_c,
+                cellular_bars,
             )
 
         except Exception as ex:
